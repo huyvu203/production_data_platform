@@ -23,35 +23,31 @@ from feast import FeatureStore
 class PredictionRequest(BaseModel):
     """Request model for prediction endpoint."""
     user_id: str = Field(..., description="User identifier")
-    product_id: str = Field(..., description="Product identifier") 
-    amount: float = Field(default=0.0, description="Transaction amount")
-    event_type: str = Field(..., description="Event type: 'view' or 'purchase'")
-    timestamp: Optional[str] = Field(default=None, description="Event timestamp (ISO format)")
+    product_id: str = Field(..., description="Product identifier")
     
     class Config:
         schema_extra = {
             "example": {
                 "user_id": "user_00123",
-                "product_id": "prod_0456",
-                "amount": 89.99,
-                "event_type": "purchase",
-                "timestamp": "2024-07-16T10:30:00"
+                "product_id": "prod_0456"
             }
         }
 
 
 class PredictionResponse(BaseModel):
     """Response model for prediction endpoint."""
-    prediction: int = Field(..., description="Prediction: 1 (will repurchase) or 0 (won't repurchase)")
-    confidence: float = Field(..., description="Prediction confidence score (0-1)")
     user_id: str = Field(..., description="User identifier")
     product_id: str = Field(..., description="Product identifier")
+    repeat_purchase_probability: float = Field(..., description="Probability of repeat purchase (0-1)")
+    confidence: str = Field(..., description="Confidence level: high, medium, low")
+    prediction_timestamp: str = Field(..., description="Prediction timestamp")
+    model_version: str = Field(..., description="Model version/training date")
     features_used: Dict[str, float] = Field(..., description="Features used for prediction")
-    timestamp: str = Field(..., description="Prediction timestamp")
 
 
 class HealthResponse(BaseModel):
     """Health check response model."""
+    service: str
     status: str
     model_loaded: bool
     feast_connected: bool
@@ -129,18 +125,23 @@ def get_features_from_feast(user_id: str, product_id: str) -> Dict[str, float]:
             "event_timestamp": datetime.now()
         }])
         
-        # Retrieve features
+        # Retrieve features for our actual trained model
         features = feature_store.get_online_features(
             features=[
-                "user_features:total_spend",
-                "user_features:avg_transaction_amount", 
-                "user_features:days_since_last_purchase",
-                "user_features:repeat_purchase_count",
-                "user_features:purchase_count",
-                "user_features:view_count",
-                "user_features:product_view_count",
-                "user_features:product_purchase_count",
-                "user_features:view_to_purchase_ratio",
+                "user_behavior_features:COUNT(events)",
+                "user_behavior_features:MAX(events.amount)",
+                "user_behavior_features:MEAN(events.amount)",
+                "user_behavior_features:MIN(events.amount)",
+                "user_behavior_features:SUM(events.amount)",
+                "user_behavior_features:total_spend",
+                "user_behavior_features:avg_transaction_amount", 
+                "user_behavior_features:days_since_last_purchase",
+                "user_behavior_features:repeat_purchase_count",
+                "user_behavior_features:purchase_count",
+                "user_behavior_features:view_count",
+                "user_behavior_features:product_view_count",
+                "user_behavior_features:product_purchase_count",
+                "user_behavior_features:view_to_purchase_ratio",
             ],
             entity_rows=entity_df.to_dict("records")
         ).to_dict()
@@ -161,15 +162,20 @@ def get_features_from_feast(user_id: str, product_id: str) -> Dict[str, float]:
 def get_dummy_features() -> Dict[str, float]:
     """Return dummy features when Feast is not available."""
     return {
-        "total_spend": 250.0,
-        "avg_transaction_amount": 50.0,
-        "days_since_last_purchase": 7,
-        "repeat_purchase_count": 2,
-        "purchase_count": 5,
-        "view_count": 20,
-        "product_view_count": 3,
-        "product_purchase_count": 1,
-        "view_to_purchase_ratio": 4.0,
+        "COUNT(events)": 5.0,
+        "MAX(events.amount)": 250.0,
+        "MEAN(events.amount)": 150.0,
+        "MIN(events.amount)": 50.0,
+        "SUM(events.amount)": 750.0,
+        "total_spend": 750.0,
+        "avg_transaction_amount": 150.0,
+        "days_since_last_purchase": 7.0,
+        "repeat_purchase_count": 1.0,
+        "purchase_count": 3.0,
+        "view_count": 8.0,
+        "product_view_count": 2.0,
+        "product_purchase_count": 1.0,
+        "view_to_purchase_ratio": 2.67
     }
 
 
@@ -181,28 +187,23 @@ def prepare_features_for_prediction(
     Prepare feature vector for model prediction.
     
     Args:
-        base_features: Base features from Feast
+        base_features: Base features from Feast or dummy features
         request: Prediction request data
         
     Returns:
         Feature vector ready for model prediction
     """
-    # Start with base features
+    # Use the base features as-is since they match our training features
     features = base_features.copy()
     
-    # Add on-demand features
-    features["amount_vs_avg_ratio"] = (
-        request.amount / max(features.get("avg_transaction_amount", 1), 1)
-    )
-    features["is_purchase_event"] = 1 if request.event_type == "purchase" else 0
-    
-    # Ensure all required features are present
+    # Ensure all required features are present in the correct order
     feature_vector = []
     for feature_name in feature_names:
         if feature_name in features:
-            feature_vector.append(features[feature_name])
+            feature_vector.append(float(features[feature_name]))
         else:
             # Default value for missing features
+            print(f"Warning: Missing feature {feature_name}, using default value 0.0")
             feature_vector.append(0.0)
     
     return np.array(feature_vector).reshape(1, -1)
@@ -215,10 +216,11 @@ async def startup_event():
     initialize_feast()
 
 
-@app.get("/health", response_model=HealthResponse)
+@app.get("/", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint."""
     return HealthResponse(
+        service="E-commerce Repeat Purchase Prediction API",
         status="healthy",
         model_loaded=model is not None,
         feast_connected=feature_store is not None,
@@ -232,41 +234,56 @@ async def predict_repeat_purchase(request: PredictionRequest):
     Predict whether a user will repurchase a product.
     
     Args:
-        request: Prediction request containing user_id, product_id, etc.
+        request: Prediction request containing user_id, product_id
         
     Returns:
-        Prediction result with confidence score
+        Prediction result with probability and confidence
     """
     if model is None:
         raise HTTPException(status_code=500, detail="Model not loaded")
     
     try:
-        # Get features from Feast
+        # Get features from Feast or fallback to dummy features
         base_features = get_features_from_feast(request.user_id, request.product_id)
         
         # Prepare feature vector
         X = prepare_features_for_prediction(base_features, request)
         
-        # Make prediction
-        prediction = model.predict(X)[0]
+        # Make prediction - get probability for repeat purchase (class 1)
         prediction_proba = model.predict_proba(X)[0]
-        confidence = float(max(prediction_proba))
+        repeat_purchase_probability = float(prediction_proba[1])
+        
+        # Determine confidence level
+        confidence = "high" if repeat_purchase_probability > 0.7 or repeat_purchase_probability < 0.3 else "medium"
+        if 0.4 <= repeat_purchase_probability <= 0.6:
+            confidence = "low"
         
         # Prepare features used for response
         features_dict = {}
         for i, feature_name in enumerate(feature_names):
             features_dict[feature_name] = float(X[0, i])
         
+        # Load model metadata for version
+        model_dir = Path(__file__).parent.parent / "model"
+        metadata_path = model_dir / "model_metadata.json"
+        model_version = "unknown"
+        if metadata_path.exists():
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+                model_version = metadata.get("training_date", "unknown")
+        
         return PredictionResponse(
-            prediction=int(prediction),
-            confidence=confidence,
             user_id=request.user_id,
             product_id=request.product_id,
-            features_used=features_dict,
-            timestamp=datetime.now().isoformat()
+            repeat_purchase_probability=repeat_purchase_probability,
+            confidence=confidence,
+            prediction_timestamp=datetime.now().isoformat(),
+            model_version=model_version,
+            features_used=features_dict
         )
         
     except Exception as e:
+        print(f"❌ Prediction error: {e}")
         raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
 
 
@@ -290,14 +307,11 @@ async def predict_batch(requests: list[PredictionRequest]):
             prediction_result = await predict_repeat_purchase(request)
             results.append(prediction_result)
         except Exception as e:
-            # Include error information for failed predictions
-            results.append({
-                "user_id": request.user_id,
-                "product_id": request.product_id,
-                "error": str(e)
-            })
+            print(f"❌ Batch prediction failed for {request.user_id}-{request.product_id}: {e}")
+            # Continue with other predictions
+            continue
     
-    return results
+    return {"predictions": results, "total": len(results), "timestamp": datetime.now().isoformat()}
 
 
 @app.get("/model/info")
